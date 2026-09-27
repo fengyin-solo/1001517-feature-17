@@ -18,6 +18,32 @@
       </article>
     </div>
 
+    <section v-if="completion" class="completion-panel">
+      <header class="completion-head">
+        <h3>结班判定</h3>
+        <p class="completion-condition">结班条件：{{ completion.condition.说明 }}</p>
+      </header>
+      <template v-if="completion.待结班数 > 0">
+        <p class="completion-summary">
+          待结班 {{ completion.待结班数 }} 人，达标 {{ completion.达标人数 }} 人，未达标 {{ completion.未达标人数 }} 人
+        </p>
+        <table v-if="completion.未达标名单.length" class="data-table">
+          <thead>
+            <tr>
+              <th v-for="column in unqualifiedColumns" :key="column">{{ column }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in completion.未达标名单" :key="String(row.id)">
+              <td v-for="column in unqualifiedColumns" :key="column">{{ row[column] ?? '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="empty-state">待结班的培训对象均已达标，可逐条执行确认结班</p>
+      </template>
+      <p v-else class="empty-state">当前没有待结班的培训，暂无结班判定对象</p>
+    </section>
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -57,29 +83,63 @@
 
     <footer class="page-foot">
       <span>共 {{ total }} 条人员培训记录</span>
+      <span v-if="noticeMessage" class="notice-text">{{ noticeMessage }}</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
   </section>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { request } from '@/api/client'
 
 type Row = Record<string, string | number | null>
 
+interface CompletionSummary {
+  condition: {
+    及格成绩: number
+    满分: number
+    标准课时: number
+    说明: string
+  }
+  待结班数: number
+  达标人数: number
+  未达标人数: number
+  未达标名单: Row[]
+}
+
 const ENDPOINT = '/api/training'
 const columns = ["培训编号", "培训主题", "培训对象", "授课人员", "培训课时", "考核成绩", "培训日期", "培训状态"]
 const actions = ["开班登记", "确认结班", "取消培训"]
-const statuses = ["待开班", "进行中", "已结班", "已取消"]
-const stats = [{"label": "待开班培训", "value": 0}, {"label": "本月结班数", "value": 0}, {"label": "考核未通过", "value": 0}]
+const unqualifiedColumns = ["培训编号", "培训主题", "培训对象", "培训课时", "考核成绩", "未达标原因"]
+// 筛选框列名与后端查询参数的对应关系，保证筛选条件真正生效
+const filterParamMap: Record<string, string> = { "培训编号": "keyword", "培训主题": "topic", "培训对象": "trainee" }
 
 const rows = ref<Row[]>([])
 const total = ref(0)
 const errorMessage = ref('')
+const noticeMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+const completion = ref<CompletionSummary | null>(null)
+
+const stats = computed(() => [
+  { label: '待结班培训', value: completion.value?.待结班数 ?? 0 },
+  { label: '达标人数', value: completion.value?.达标人数 ?? 0 },
+  { label: '未达标人数', value: completion.value?.未达标人数 ?? 0 },
+])
+
+function buildQuery(): string {
+  const params = new URLSearchParams()
+  for (const [field, param] of Object.entries(filterParamMap)) {
+    const value = filters.value[field]?.trim()
+    if (value) {
+      params.set(param, value)
+    }
+  }
+  return params.toString()
+}
 
 function resetFilters() {
   filters.value = {}
@@ -96,14 +156,18 @@ function openCreate() {
 
 async function runAction(action: string, row: Row) {
   errorMessage.value = ''
+  noticeMessage.value = ''
   try {
     const response = await request(`${ENDPOINT}/${row.id}/actions`, {
       method: 'POST',
       body: JSON.stringify({ action }),
     })
-    if (!response.ok) {
-      throw new Error('人员培训动作未生效，请稍后重试')
+    const payload = await response.json().catch(() => null)
+    if (!response.ok || !payload?.ok) {
+      // 结班被拦下时展示后端给出的具体原因；筛选条件保持不动，可直接重试
+      throw new Error(payload?.message ?? `人员培训动作「${action}」未生效，请稍后重试`)
     }
+    noticeMessage.value = payload.message ?? `培训记录已${action}`
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '人员培训操作失败'
@@ -112,15 +176,23 @@ async function runAction(action: string, row: Row) {
 
 async function reload() {
   errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
+  const query = buildQuery()
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
-    if (!response.ok) {
+    // 列表与结班判定用同一份筛选条件同时刷新，保证页面上的人数与列表数据一致
+    const [listResponse, completionResponse] = await Promise.all([
+      request(`${ENDPOINT}?${query}`),
+      request(`${ENDPOINT}/completion?${query}`),
+    ])
+    if (!listResponse.ok) {
       throw new Error('培训记录列表读取失败')
     }
-    const payload = await response.json()
+    if (!completionResponse.ok) {
+      throw new Error('结班判定汇总读取失败')
+    }
+    const payload = await listResponse.json()
     rows.value = payload.items ?? []
     total.value = payload.total ?? rows.value.length
+    completion.value = await completionResponse.json()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '人员培训列表读取失败'
   }
@@ -128,3 +200,34 @@ async function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.completion-panel {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.completion-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.completion-head h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.completion-condition {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.completion-summary {
+  margin: 8px 0;
+  font-size: 13px;
+}
+.notice-text {
+  color: #067647;
+}
+</style>
